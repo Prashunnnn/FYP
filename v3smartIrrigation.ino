@@ -3,40 +3,42 @@
 #include <ArduinoJson.h>
 #include <ESPAsyncWebServer.h>
 #include <HTTPClient.h>
-#include <WiFiClientSecure.h> 
+#include <WiFiClientSecure.h>
 
-// Wi-Fi Credentials
+// Wi-Fi Configuration
 const char* ssid = "prashun";
 const char* password = "12345678";
-const char* serverName = "http://192.168.1.132/moisture_project/store_moisture.php"; //cmd->ipconfig->enter your local ip
+const char* serverName = "http://192.168.101.7/moisture_project/store_moisture.php";
 
 // Weather API
-String API_KEY = "92325fb9f39650118b62df5c4363b7a5";
+const String API_KEY = "92325fb9f39650118b62df5c4363b7a5";
 String CITY = "Kathmandu";
 String API_URL = "http://api.openweathermap.org/data/2.5/weather?q=" + CITY + "&appid=" + API_KEY + "&units=metric";
 String FORECAST_URL = "http://api.openweathermap.org/data/2.5/forecast?q=" + CITY + "&appid=" + API_KEY + "&units=metric";
 
-// Telegram alert bot
-const char* telegramBotToken = "8178345756:AAEvZv-38_BJGtn9SB4ZLRjv9Kj-m2jCXZs"; // botfather telegram, to create new bots
+// Telegram
+const char* telegramBotToken = "8178345756:AAEvZv-38_BJGtn9SB4ZLRjv9Kj-m2jCXZs";
 const char* telegramChatID = "5784424361";
 
-// Web Server
-AsyncWebServer server(80);
-
-// Pins
+// Hardware Pins
 #define SOIL_SENSOR_PIN 34
 #define RELAY_PIN 23
-#define BUTTON_PIN 18  // Optional manual button
-#define DHTPIN 22   // DHT Sensor Pin
-#define DHTTYPE DHT11  // DHT11 or DHT22
+#define BUTTON_PIN 18
+#define DHTPIN 22
+#define DHTTYPE DHT11
 
 DHT dht(DHTPIN, DHTTYPE);
+AsyncWebServer server(80);
 
-const int threshold = 40; // Moisture threshold for alert
+// Global Variables
+const int threshold = 40;
 unsigned long lastSendTime = 0;
-const long sendInterval = 30000; // 10 seconds
+const long sendInterval = 30000;
 unsigned long lastToggleTime = 0;
-const unsigned long debounceDelay = 1000;  // 1-second debounce delay
+const unsigned long debounceDelay = 1000;
+unsigned long lastWeatherUpdate = 0;
+const long weatherUpdateInterval = 600000;
+
 bool onlineMode = false;
 bool pumpState = false;
 bool alertSent = false;
@@ -44,42 +46,219 @@ int moisturePercent = 0;
 float temp = 0.0;
 float humidity = 0.0;
 
-// Function to Fetch Weather Data
-String getWeatherData(String city) {
-    HTTPClient http;
-    String url = "http://api.openweathermap.org/data/2.5/weather?q=" + city + "&appid=" + API_KEY + "&units=metric";
-    http.begin(url);
-    int httpResponseCode = http.GET();
+String currentWeather = "{}";
+String forecastData = "{}";
 
-    if (httpResponseCode > 0) {
-        String payload = http.getString();
-        http.end();
-        return payload;
-    } else {
-        http.end();
-        return "Error Fetching Weather Data";
+// Function Prototypes
+void handleRelay(bool state);
+void updateWeatherData();
+void handleSensorData(AsyncWebServerRequest *request);
+void startServer();
+void sendMoistureData(int moisture, float temp, float humidity);
+void sendAlert();
+String urlEncode(String str);
+
+void setup() {
+    Serial.begin(115200);
+    pinMode(RELAY_PIN, OUTPUT);
+    digitalWrite(RELAY_PIN, HIGH);
+    pinMode(SOIL_SENSOR_PIN, INPUT);
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
+    dht.begin();
+
+    WiFi.begin(ssid, password);
+    Serial.print("Connecting to WiFi");
+    for(int i=0; i<15; i++) {
+        if(WiFi.status() == WL_CONNECTED) break;
+        delay(1000);
+        Serial.print(".");
     }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        onlineMode = true;
+        Serial.println("\nConnected! IP: " + WiFi.localIP().toString());
+        updateWeatherData();
+    } else {
+        Serial.println("\nStarting AP Mode");
+        WiFi.softAP("ESP32-Irrigation", "12345678");
+    }
+
+    startServer();
 }
 
-// Function to fetch forecasted data
-String getForecastData(String city) {
-    HTTPClient http;
-    String url = "http://api.openweathermap.org/data/2.5/forecast?q=" + city + "&appid=" + API_KEY + "&units=metric";
-    http.begin(url);
-    int httpResponseCode = http.GET();
-
-    if (httpResponseCode > 0) {
-        String payload = http.getString();
-        http.end();
-        return payload;
-    } else {
-        Serial.println("Error Fetching Forecast Data");
-        http.end();
-        return "{}";
+void loop() {
+    unsigned long currentMillis = millis();
+    
+    // Update weather every 10 minutes
+    if (currentMillis - lastWeatherUpdate >= weatherUpdateInterval) {
+        updateWeatherData();
+        lastWeatherUpdate = currentMillis;
     }
+
+    // Moisture management
+    static unsigned long lastMoistureCheck = 0;
+    if (currentMillis - lastMoistureCheck >= 2000) {
+        int moisture = analogRead(SOIL_SENSOR_PIN);
+        moisturePercent = map(constrain(moisture, 2500, 4095), 4095, 2500, 0, 100);
+        
+        if (moisturePercent < threshold && !pumpState) {
+            handleRelay(true);
+        } else if (moisturePercent >= threshold && pumpState) {
+            handleRelay(false);
+        }
+        
+        lastMoistureCheck = currentMillis;
+    }
+
+    // Data sending
+    if (onlineMode && (currentMillis - lastSendTime >= sendInterval)) {
+        sendMoistureData(moisturePercent, temp, humidity);
+        lastSendTime = currentMillis;
+    }
+
+    // Alert handling
+    if (moisturePercent < threshold && !alertSent) {
+        sendAlert();
+        alertSent = true;
+    } else if (moisturePercent >= threshold) {
+        alertSent = false;
+    }
+
+    delay(100);
 }
 
-// Function to Handle Web Requests
+void handleRelay(bool state) {
+    if (state) {
+        pinMode(RELAY_PIN, OUTPUT);
+        digitalWrite(RELAY_PIN, LOW); // Active LOW - turn ON
+    } else {
+        pinMode(RELAY_PIN, INPUT_PULLUP); // Disable relay
+        digitalWrite(RELAY_PIN, HIGH);    // Optional - for clarity
+    }
+    pumpState = state;
+    Serial.println("Pump " + String(state ? "ON" : "OFF"));
+}
+
+void updateWeatherData() {
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    HTTPClient http;
+    
+    // Update current weather
+    http.begin(API_URL);
+    if (http.GET() == HTTP_CODE_OK) {
+        currentWeather = http.getString();
+        Serial.println("Current weather updated");
+    }
+    http.end();
+
+    // Update forecast
+    http.begin(FORECAST_URL);
+    if (http.GET() == HTTP_CODE_OK) {
+        forecastData = http.getString();
+        Serial.println("Forecast updated");
+    }
+    http.end();
+}
+
+void handleSensorData(AsyncWebServerRequest *request) {
+    DynamicJsonDocument json(2048);
+    
+    int moisture = analogRead(SOIL_SENSOR_PIN);
+    moisturePercent = map(constrain(moisture, 2500, 4095), 4095, 2500, 0, 100);
+    temp = dht.readTemperature();
+    humidity = dht.readHumidity();
+
+    json["moisture"] = moisturePercent;
+    json["temperature"] = isnan(temp) ? 0.0 : temp;
+    json["humidity"] = isnan(humidity) ? 0.0 : humidity;
+    json["pump"] = pumpState;
+
+    DynamicJsonDocument weatherDoc(1024);
+    deserializeJson(weatherDoc, currentWeather);
+    json["pressure"] = weatherDoc["main"]["pressure"] | 0;
+    json["wind_speed"] = weatherDoc["wind"]["speed"] | 0.0;
+    json["condition"] = weatherDoc["weather"][0]["description"].as<String>();
+
+    DynamicJsonDocument forecastDoc(4096);
+    deserializeJson(forecastDoc, forecastData);
+    JsonArray forecastArray = json.createNestedArray("forecast");
+    
+    if (forecastDoc.containsKey("list")) {
+        for (int i = 0; i < 3; i++) {
+            JsonObject item = forecastDoc["list"][i];
+            JsonObject forecastItem = forecastArray.createNestedObject();
+            forecastItem["time"] = item["dt_txt"].as<String>();
+            forecastItem["temp"] = item["main"]["temp"];
+            forecastItem["condition"] = item["weather"][0]["description"].as<String>();
+        }
+    }
+
+    String response;
+    serializeJson(json, response);
+    request->send(200, "application/json", response);
+}
+
+void sendMoistureData(int moisture, float temp, float humidity) {
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    HTTPClient http;
+    WiFiClient client;
+    
+    String postData = "moisture=" + String(moisture) + 
+                     "&temperature=" + String(temp) + 
+                     "&humidity=" + String(humidity);
+
+    http.begin(client, serverName);
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+    int httpCode = http.POST(postData);
+    if (httpCode > 0) {
+        Serial.printf("Data sent: %d\n", httpCode);
+    } else {
+        Serial.printf("Data send failed: %s\n", http.errorToString(httpCode).c_str());
+    }
+    http.end();
+}
+
+void sendAlert() {
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    WiFiClientSecure client;
+    client.setInsecure();
+    
+    String message = "🚨 Alert! Soil Moisture Low: " + String(moisturePercent) + "%";
+    String url = "https://api.telegram.org/bot" + String(telegramBotToken) +
+                "/sendMessage?chat_id=" + String(telegramChatID) +
+                "&text=" + urlEncode(message);
+
+    HTTPClient http;
+    http.begin(client, url);
+    int httpCode = http.GET();
+    if (httpCode == HTTP_CODE_OK) {
+        Serial.println("Alert sent");
+    } else {
+        Serial.println("Alert failed: " + String(httpCode));
+    }
+    http.end();
+}
+
+String urlEncode(String str) {
+    String encoded = "";
+    char c;
+    for (unsigned int i = 0; i < str.length(); i++) {
+        c = str.charAt(i);
+        if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+            encoded += c;
+        } else if (c == ' ') {
+            encoded += "%20";
+        } else {
+            encoded += "%" + String(String(c, HEX).c_str());
+        }
+    }
+    return encoded;
+}
+
 void startServer() {
     server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
         String html = R"rawliteral(
@@ -87,157 +266,74 @@ void startServer() {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Smart Irrigation System</title>
-    <!-- Bootstrap CSS -->
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
-        body {
-            background: #1E3C72;
-            text-align: center;
-            padding: 20px;
-            color: #fff;
-            font-family: 'Poppins', sans-serif;
-        }
-        .card {
-            border-radius: 15px;
-            backdrop-filter: blur(20px);
-            background: rgba(255, 255, 255, 0.15);
-            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
-            padding: 20px;
-            color: #fff;
-            transition: transform 0.3s, box-shadow 0.3s;
-        }
-        .card:hover {
-            transform: scale(1.03);
-            box-shadow: 0 6px 15px rgba(0, 0, 0, 0.4);
-        }
-        .pump-box {
-            background: rgba(0, 0, 0, 0.2);
-            padding: 15px;
-            border-radius: 10px;
-            display: inline-block;
-            margin-top: 20px;
-        }
-        .btn-toggle {
-            background: #28a745;
-            color: white;
-            border: none;
-            padding: 12px 24px;
-            font-size: 1.2em;
-            border-radius: 10px;
-            transition: background 0.3s ease-in-out;
-        }
-        .btn-toggle:hover {
-            background: #218838;
-        }
-        
-        #forecast-table {
-            width: 100%;
-            table-layout: auto; 
-            word-wrap: break-word;
-            border-collapse: collapse; 
-        }
-
-        #forecast-table th {
-            background: rgba(0, 0, 0, 0.4);
-            font-weight: bold;
-            color: #ffffff;
-            font-size: 1em; /* Reduce font size */
-            text-transform: uppercase;
-            padding: 10px;
-        }
-
-        #forecast-table td {
-            padding: 8px;
-            font-size: 0.9em; 
-            text-align: center;
-            white-space: nowrap; 
-            overflow: hidden;
-            text-overflow: ellipsis;
-        }
-
-        #forecast-table tbody tr:nth-child(even) {
-            background: rgba(255, 255, 255, 0.1);
-        }
-
-        #forecast-table tbody tr:hover {
-            background: rgba(255, 255, 255, 0.2);
-            transform: scale(1.01);
-            transition: all 0.3s ease-in-out;
-        }
-
-        @media (max-width: 576px) {
-            #forecast-table th, #forecast-table td {
-                font-size: 0.85em; /* Further reduce font size for mobile */
-                padding: 6px;
-            }
-            .card {
-                padding: 15px;
-            }
-            .table-responsive {
-                padding: 10px;
-            }
-        }
-
-        .card {
-            border-radius: 18px;
-            background: rgba(255, 255, 255, 0.15);
-            box-shadow: 0 6px 15px rgba(0, 0, 0, 0.4);
-            backdrop-filter: blur(15px);
-        }
-
-        .table-responsive {
-            border-radius: 12px;
-            background: rgba(255, 255, 255, 0.1);
-            padding: 15px;
-            overflow-x: auto;
-            display: block;
-            width: 100%;
-        }
-
-        .city-input {
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            gap: 10px;
-            flex-wrap: wrap;
-            margin-bottom: 20px;
-        }
-
-        .city-input input {
-            padding: 10px;
-            border-radius: 5px;
-            border: none;
-            width: 200px;
-            justify-content: center;
-            align-items: center;
-        }
-
-        .city-input button {
-            padding: 10px 20px;
-            border-radius: 5px;
-            border: none;
-            background: #28a745;
-            color: white;
-            cursor: pointer;
-        }
-
-        .city-input button:hover {
-            background: #218838;
-        }
-    </style>
+    body {
+        background: linear-gradient(135deg, #C7F0BD 0%, #9BC490 100%);
+        color: #2c3e50;
+        min-height: 100vh;
+        padding: 20px;
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    }
+    .card {
+        background: rgba(255, 255, 255, 0.85);
+        backdrop-filter: blur(10px);
+        border-radius: 15px;
+        padding: 20px;
+        margin: 10px;
+        box-shadow: 0 4px 30px rgba(0, 0, 0, 0.1);
+        transition: all 0.3s ease; /* NEW */
+        cursor: pointer; /* NEW */
+    }
+    .card:hover { /* NEW */
+        transform: translateY(-5px);
+        box-shadow: 0 8px 30px rgba(0, 0, 0, 0.2);
+        background: rgba(255, 255, 255, 0.95);
+    }
+    .btn-toggle {
+        background: #8BBF8A;
+        border: none;
+        padding: 12px 24px;
+        font-size: 1.1em;
+        transition: all 0.3s ease;
+        color: white;
+    }
+    .btn-toggle:hover {
+        background: #75A773;
+        transform: scale(1.05);
+        box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2); /* NEW */
+    }
+    #forecast-table {
+        background: rgba(255, 255, 255, 0.8);
+        border-radius: 10px;
+        overflow: hidden;
+    }
+    #forecast-table tr { /* NEW */
+        transition: background-color 0.3s ease;
+    }
+    #forecast-table tr:hover { /* NEW */
+        background-color: rgba(255, 255, 255, 0.9);
+    }
+    .pump-box { /* NEW */
+        transition: all 0.3s ease;
+    }
+    .pump-box:hover { /* NEW */
+        transform: scale(1.02);
+    }
+</style>
 </head>
 <body>
-    <h1 class="mb-4">🌳 Smart Irrigation System</h1>
+    <h1 class="text-center mb-4">🌱 Smart Irrigation System</h1>
 
     <div class="container">
-        <div class="city-input">
-            <input type="text" id="city-input" placeholder="Enter City Name">
-            <button onclick="updateCity()">Update City</button>
+        <div class="city-input mb-4">
+            <input type="text" id="city-input" placeholder="Enter City" class="form-control">
+            <button onclick="updateCity()" class="btn btn-success mt-2">Update City</button>
         </div>
 
-        <div class="row justify-content-center g-3">
+        <div class="row g-4">
             <div class="col-md-4">
                 <div class="card">
                     <h3>🌱 Soil Moisture</h3>
@@ -257,152 +353,142 @@ void startServer() {
                 </div>
             </div>
         </div>
-        
-        <div class="row justify-content-center g-3 mt-3">
+
+        <div class="row mt-4">
             <div class="col-md-6">
                 <div class="card">
-                    <h3>🌦️ Live Weather Information</h3>
+                    <h3>🌦️ Current Weather</h3>
                     <p><strong>Pressure:</strong> <span id="pressure">--</span> hPa</p>
-                    <p><strong>Condition:</strong> <span id="condition">Loading...</span></p>
+                    <p><strong>Condition:</strong> <span id="condition">--</span></p>
                     <p><strong>Wind Speed:</strong> <span id="wind_speed">--</span> km/h</p>
                 </div>
             </div>
-        </div>
-
-        <div class="row justify-content-center g-3 mt-3">
-            <div class="col-md-8">
+            <div class="col-md-6">
                 <div class="card">
-                    <h3>☁️ Weather Forecast </h3>
-                    <div class="table-responsive">
-                        <table class="table table-dark table-hover" id="forecast-table">
-                            <thead>
-                                <tr>
-                                    <th>Time</th>
-                                    <th>Temperature</th>
-                                    <th>Condition</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                <!-- Forecast data will be dynamically injected here -->
-                            </tbody>
-                        </table>
+                    <h3>⚡ Pump Control</h3>
+                    <div class="pump-box">
+                        <p>Status: <span id="pump-status" class="fw-bold">OFF</span></p>
+                        <button id="toggle-button" class="btn btn-toggle w-100">Toggle Pump</button>
                     </div>
                 </div>
             </div>
         </div>
 
-        <div class="pump-box">
-            <p class="pump-status">⚡ Pump Status: <span id="pump-status" class="text-danger">OFF</span></p>
-            <button id="toggle-button" class="btn btn-toggle">Toggle Pump</button>
+        <div class="card mt-4">
+            <h3>📅 Weather Forecast</h3>
+            <div class="table-responsive">
+                <table class="table" id="forecast-table">
+                    <thead>
+                        <tr>
+                            <th>Date/Time</th>
+                            <th>Temp (°C)</th>
+                            <th>Conditions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <!-- Forecast data will be inserted here -->
+                    </tbody>
+                </table>
+            </div>
         </div>
+    </div>
 
-        <script>
-            function fetchData() {
-                fetch('/sensor-data')
-                    .then(response => response.json())
-                    .then(data => {
-                        updateSensorData(data);
-                        updateForecastTable(data.forecast);
-                    })
-                    .catch(error => console.error("Error fetching data:", error));
-            }
-
-            function updateCity() {
-              const city = document.getElementById('city-input').value;
-              fetch('/update-city?city=' + city)
-                  .then(response => response.text())
-                  .then(data => {
-                      console.log(data);
-                      fetchData(); // Ensure data updates after city change
-        })
-        .catch(error => console.error("Error updating city:", error));
+    <script>
+        function fetchData() {
+            fetch('/sensor-data')
+                .then(response => {
+                    if (!response.ok) throw new Error('Network error');
+                    return response.json();
+                })
+                .then(data => {
+                    updateSensorData(data);
+                    updateForecastTable(data.forecast);
+                })
+                .catch(error => {
+                    console.error('Fetch error:', error);
+                    document.getElementById('moisture').innerHTML = '⚠️';
+                });
         }
 
-            function updateSensorData(data) {
-                document.getElementById('moisture').innerText = `${data.moisture}%`;
-                document.getElementById('temperature').innerText = `${data.temperature}°C`;
-                document.getElementById('humidity').innerText = `${data.humidity}%`;
-                document.getElementById('pressure').innerText = `${data.pressure}`;
-                document.getElementById('condition').innerText = data.condition;
-                document.getElementById("wind_speed").innerText = `${(data.wind_speed * 3.6).toFixed(1)}`;
+        function updateSensorData(data) {
+            document.getElementById('moisture').textContent = `${data.moisture}%`;
+            document.getElementById('temperature').textContent = `${data.temperature.toFixed(1)}°C`;
+            document.getElementById('humidity').textContent = `${data.humidity.toFixed(1)}%`;
+            document.getElementById('pressure').textContent = data.pressure;
+            document.getElementById('wind_speed').textContent = (data.wind_speed * 3.6).toFixed(1);
+            document.getElementById('condition').textContent = data.condition;
+            
+            const pumpStatus = document.getElementById('pump-status');
+            pumpStatus.textContent = data.pump ? 'ON' : 'OFF';
+            pumpStatus.className = data.pump ? 'text-success' : 'text-danger';
+        }
 
-                let pumpStatus = document.getElementById("pump-status");
-                pumpStatus.innerText = data.pump ? "ON" : "OFF";
-                pumpStatus.className = data.pump ? "text-success fw-bold" : "text-danger fw-bold";
+        function updateForecastTable(forecast) {
+            const tbody = document.querySelector('#forecast-table tbody');
+            tbody.innerHTML = '';
+            
+            if(forecast && forecast.length > 0) {
+                forecast.forEach(item => {
+                    const row = document.createElement('tr');
+                    row.innerHTML = `
+                        <td>${formatDateTime(item.time)}</td>
+                        <td>${item.temp.toFixed(1)}°C</td>
+                        <td>${getWeatherIcon(item.condition)} ${item.condition}</td>
+                    `;
+                    tbody.appendChild(row);
+                });
+            } else {
+                tbody.innerHTML = `
+                    <tr>
+                        <td colspan="3" class="text-center">No forecast data available</td>
+                    </tr>
+                `;
             }
+        }
 
-            function updateForecastTable(forecast) {
-                const forecastTable = document.querySelector("#forecast-table tbody");
-                forecastTable.innerHTML = ''; // Clear previous data
-
-                if (forecast && forecast.length > 0) {
-                    forecast.forEach(forecastEntry => {
-                        let row = document.createElement("tr");
-
-                        // Date & Time Column
-                        let dateTimeCell = document.createElement("td");
-                        dateTimeCell.innerText = formatDateTime(forecastEntry.time);
-                        row.appendChild(dateTimeCell);
-
-                        // Temperature Column
-                        let tempCell = document.createElement("td");
-                        tempCell.innerText = `${forecastEntry.temp.toFixed(1)}°C`;
-                        row.appendChild(tempCell);
-
-                        // Condition Column with Icon
-                        let conditionCell = document.createElement("td");
-                        let iconSpan = document.createElement("span");
-                        iconSpan.innerHTML = getWeatherIcon(forecastEntry.condition) + " ";
-                        let textNode = document.createTextNode(forecastEntry.condition);
-                        conditionCell.appendChild(iconSpan);
-                        conditionCell.appendChild(textNode);
-                        row.appendChild(conditionCell);
-
-                        forecastTable.appendChild(row);
-                    });
-                } else {
-                    let row = document.createElement("tr");
-                    row.innerHTML = `<td colspan="3" class="text-center text-warning">No forecast data available</td>`;
-                    forecastTable.appendChild(row);
-                }
-            }
-
-            function formatDateTime(timestamp) {
-                let date = new Date(timestamp);
-                let options = { weekday: 'short', month: 'short', day: 'numeric' };
-                let formattedDate = date.toLocaleDateString('en-US', options);
-                let hours = date.getHours();
-                let minutes = date.getMinutes();
-                let ampm = hours >= 12 ? "PM" : "AM";
-                hours = hours % 12 || 12;
-                let formattedTime = `${hours}:${minutes.toString().padStart(2, '0')} ${ampm}`;
-                return `${formattedDate}, ${formattedTime}`;
-            }
-
-            function getWeatherIcon(condition) {
-                condition = condition.toLowerCase();
-                if (condition.includes("clear")) return "☀️";
-                if (condition.includes("cloud")) return "☁️";
-                if (condition.includes("rain")) return "🌧️";
-                if (condition.includes("storm")) return "⛈️";
-                if (condition.includes("snow")) return "❄️";
-                if (condition.includes("haze") || condition.includes("fog")) return "🌫️";
-                return "🌍";
-            }
-
-            document.getElementById("toggle-button").addEventListener("click", function() {
-                fetch("/toggle-pump")
-                    .then(response => response.text())
-                    .then(status => {
-                        document.getElementById("pump-status").innerText = status;
-                        document.getElementById("pump-status").className = status === "ON" ? "text-success" : "text-danger";
-                    })
-                    .catch(error => console.error("Error toggling pump:", error));
+        function formatDateTime(str) {
+            const date = new Date(str);
+            return date.toLocaleString('en-US', {
+                weekday: 'short',
+                month: 'short',
+                day: 'numeric',
+                hour: 'numeric',
+                minute: '2-digit'
             });
+        }
 
-            setInterval(fetchData, 3000);
-        </script>
-    </div>
+        function getWeatherIcon(condition) {
+            condition = condition.toLowerCase();
+            if (condition.includes('cloud')) return '☁️';
+            if (condition.includes('rain')) return '🌧️';
+            if (condition.includes('sun') || condition.includes('clear')) return '☀️';
+            if (condition.includes('snow')) return '❄️';
+            if (condition.includes('storm')) return '⛈️';
+            return '🌫️';
+        }
+
+        function updateCity() {
+            const city = document.getElementById('city-input').value;
+            fetch(`/update-city?city=${encodeURIComponent(city)}`)
+                .then(response => response.text())
+                .then(() => fetchData())
+                .catch(console.error);
+        }
+
+        document.getElementById('toggle-button').addEventListener('click', () => {
+            fetch('/toggle-pump')
+                .then(response => response.text())
+                .then(status => {
+                    const pumpStatus = document.getElementById('pump-status');
+                    pumpStatus.textContent = status;
+                    pumpStatus.className = status === 'ON' ? 'text-success' : 'text-danger';
+                })
+                .catch(console.error);
+        });
+
+        setInterval(fetchData, 2000);
+        fetchData();
+    </script>
 </body>
 </html>
 )rawliteral";
@@ -410,91 +496,16 @@ void startServer() {
         request->send(200, "text/html", html);
     });
 
-    server.on("/sensor-data", HTTP_GET, [](AsyncWebServerRequest *request){
-        String weatherData = getWeatherData(CITY);  // Fetch weather info
-        String forecastData = getForecastData(CITY); // Fetch forecasted info
-
-        Serial.println("🌦️ Weather Data: " + weatherData);
-        Serial.println("☁️ Forecast Data: " + forecastData);
-
-        // Create JSON response object
-        DynamicJsonDocument json(2048);  
-
-        // Parse current weather JSON
-        DynamicJsonDocument doc(512);
-        DeserializationError error = deserializeJson(doc, weatherData);
-        
-        int pressure = 0;
-        float windSpeed = 0;
-        String condition = "Unavailable";
-
-        if (!error) {
-            pressure = doc["main"]["pressure"] | 0;
-            windSpeed = doc["wind"]["speed"] | 0.0;  
-            condition = doc["weather"][0]["description"].as<String>();
-        } else {
-            Serial.println("❌ Error parsing Weather JSON");
-        }
-
-        // Read and convert soil moisture
-        int moisture = analogRead(SOIL_SENSOR_PIN);
-        moisture = constrain(moisture, 2500, 4095);
-        int moisturePercent = map(moisture, 4095, 2500, 0, 100);
-        delay(500);
-        
-        float temp = dht.readTemperature();
-        float humidity = dht.readHumidity();
-
-        // Parse forecast JSON
-        DynamicJsonDocument forecastDoc(4096);
-        DeserializationError forecastError = deserializeJson(forecastDoc, forecastData);
-        
-        JsonArray forecastJson = json.createNestedArray("forecast");
-
-        if (!forecastError) {
-            JsonArray forecastArray = forecastDoc["list"].as<JsonArray>();
-
-            if (!forecastArray.isNull()) {
-                Serial.println("✅ Successfully parsed forecast data.");
-                for (int i = 0; i < 3 && i < forecastArray.size(); i++) {
-                    JsonObject forecastEntry = forecastArray[i];
-
-                    String time = forecastEntry["dt_txt"].as<String>();
-                    float forecastTemp = forecastEntry["main"]["temp"] | 0.0;
-                    String forecastCondition = forecastEntry["weather"][0]["description"].as<String>();
-
-                    JsonObject forecastObj = forecastJson.createNestedObject();
-                    forecastObj["time"] = time;
-                    forecastObj["temp"] = forecastTemp;
-                    forecastObj["condition"] = forecastCondition;
-                }
-            } else {
-                Serial.println("⚠️ Forecast list is empty or missing!");
-            }
-        } else {
-            Serial.println("❌ Error Parsing Forecast JSON");
-        }
-
-        // Prepare JSON response
-        json["moisture"] = moisturePercent;
-        json["temperature"] = temp;
-        json["humidity"] = humidity;
-        json["pressure"] = pressure;
-        json["wind_speed"] = windSpeed;
-    json["condition"] = condition;
-    json["pump"] = pumpState;
-
-    String response;
-    serializeJson(json, response);
-    
-    request->send(200, "application/json", response);
-});
-
+    server.on("/sensor-data", HTTP_GET, handleSensorData);
 
 server.on("/update-city", HTTP_GET, [](AsyncWebServerRequest *request){
     if (request->hasParam("city")) {
         CITY = request->getParam("city")->value();
-        Serial.println("City updated to: " + CITY);
+        // URL-encode the city name before using in API URLs
+        String encodedCity = urlEncode(CITY);
+        API_URL = "http://api.openweathermap.org/data/2.5/weather?q=" + encodedCity + "&appid=" + API_KEY + "&units=metric";
+        FORECAST_URL = "http://api.openweathermap.org/data/2.5/forecast?q=" + encodedCity + "&appid=" + API_KEY + "&units=metric";
+        updateWeatherData();
         request->send(200, "text/plain", "City updated to: " + CITY);
     } else {
         request->send(400, "text/plain", "Missing city parameter");
@@ -529,178 +540,5 @@ server.on("/toggle-pump", HTTP_GET, [](AsyncWebServerRequest *request) {
     request->send(200, "text/plain", pumpState ? "ON" : "OFF");
 });
 
-
-   server.begin();
+    server.begin();
 }
-
-void checkSoilMoisture();
-void sendMoistureData(int moisturePercent, float temp, float humidity);
-void sendAlert();
-
-void setup() {
-    Serial.begin(115200);
-    pinMode(RELAY_PIN, OUTPUT);
-    pinMode(SOIL_SENSOR_PIN, INPUT);
-    pinMode(BUTTON_PIN, INPUT_PULLUP);
-    digitalWrite(RELAY_PIN, HIGH);
-
-    dht.begin();
-
-    WiFi.begin(ssid, password);
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 10) {
-        delay(1000);
-        Serial.print(".");
-        attempts++;
-    }
-
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("Connected to Wi-Fi");
-        Serial.print("IP Address: ");
-        Serial.println(WiFi.localIP());
-        onlineMode = true;
-    } else {
-        Serial.println("\nWi-Fi Not Available, Switching to Offline Mode");
-        onlineMode = false;
-        WiFi.softAP("ESP32_Offline", "12345678");
-    }
-
-    startServer();
-}
-
-void loop() {
-    checkSoilMoisture();
-    delay(1000);
-    unsigned long currentMillis = millis();
-    
-    if (WiFi.status() == WL_CONNECTED && (currentMillis - lastSendTime > sendInterval)) {
-        sendMoistureData(moisturePercent, temp, humidity);
-        lastSendTime = currentMillis;
-    }
-
-    if (moisturePercent < threshold && !alertSent) {
-        sendAlert();
-        alertSent = true;
-    } else if (moisturePercent >= threshold) {
-        alertSent = false;
-    }
-}
-
-void checkSoilMoisture() {
-    int moisture = analogRead(SOIL_SENSOR_PIN);
-    moisture = constrain(moisture, 2500, 4095);
-    moisturePercent = map(moisture, 4095, 2500, 0, 100);
-    Serial.print("Soil Moisture: ");
-    Serial.print(moisturePercent);
-    Serial.println("%");
-
-    delay(500);
-
-    temp = dht.readTemperature();  // Read from DHT sensor
-    humidity = dht.readHumidity();
-    
-    Serial.print("Temperature: ");
-    Serial.print(temp);
-    Serial.println(" deg C");
-    Serial.print("Humidity: ");
-    Serial.print(humidity);
-    Serial.println(" %");
-
-
-    if (moisturePercent < 40 && !pumpState) {
-        pinMode(RELAY_PIN, OUTPUT);
-        digitalWrite(RELAY_PIN, LOW); // Turn ON pump
-        pumpState = true;
-        Serial.println("Pump ON");
-    } else if (moisturePercent >= 40 && pumpState) {
-        pinMode(RELAY_PIN, INPUT_PULLUP);
-        digitalWrite(RELAY_PIN, HIGH); // Turn OFF pump
-        pumpState = false;
-        Serial.println("Pump OFF");
-    }
-}
-
-void sendMoistureData(int moisturePercent, float temp, float humidity) {
-    WiFiClient client;
-    HTTPClient http;
-    
-    String postData = "moisture=" + String(moisturePercent) + 
-                      "&temperature=" + String(temp) + 
-                      "&humidity=" + String(humidity);
-
-    http.begin(client, serverName);
-    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-
-    int httpResponseCode = http.POST(postData);
-    Serial.print("HTTP Response Code: ");
-    Serial.println(httpResponseCode);
-
-    if (httpResponseCode > 0) {
-        Serial.println("Data Stored Successfully: " + http.getString());
-    } else {
-        Serial.println("Error Storing Data: " + String(httpResponseCode));
-        Serial.println("Check server, database, and PHP script.");
-    }
-
-    http.end();
-}
-
-// alert using  telegram
-String urlencode(String str) {
-    String encodedString = "";
-    char c;
-    char code0;
-    char code1;
-    for (int i = 0; i < str.length(); i++) {
-        c = str.charAt(i);
-        if (c == ' ') {
-            encodedString += "%20"; // Telegram API needs %20 for spaces
-        } else if (isalnum(c)) {
-            encodedString += c;
-        } else {
-            code1 = (c & 0xf) + '0';
-            if ((c & 0xf) > 9) code1 = (c & 0xf) - 10 + 'A';
-            c = (c >> 4) & 0xf;
-            code0 = c + '0';
-            if (c > 9) code0 = c - 10 + 'A';
-            encodedString += '%';
-            encodedString += code0;
-            encodedString += code1;
-        }
-    }
-    return encodedString;
-}
-
-void sendAlert() {
-    WiFiClientSecure client;  // Use a secure client
-    client.setInsecure();  // Ignore SSL certificate validation
-
-    HTTPClient http;
-    
-    String message = "🚨 ALERT! Soil moisture is critically low!";
-    String encodedMessage = urlencode(message);
-
-    String alertURL = "https://api.telegram.org/bot" + String(telegramBotToken) +
-                      "/sendMessage?chat_id=" + String(telegramChatID) +
-                      "&text=" + encodedMessage;
-
-    Serial.print("Telegram API Request: ");
-    Serial.println(alertURL);
-
-    http.begin(client, alertURL);  // Use the secure client
-    int httpResponseCode = http.GET();
-
-    Serial.print("Telegram HTTP Response Code: ");
-    Serial.println(httpResponseCode);
-
-    if (httpResponseCode > 0) {
-        String response = http.getString();  // Get API response
-        Serial.print("Telegram API Response: ");
-        Serial.println(response);
-    } else {
-        Serial.println("❌ Error: Failed to send request to Telegram API.");
-    }
-
-    http.end();
-}
-
