@@ -1,7 +1,8 @@
 <?php
 include('config.php');
 
-if (!isset($_SESSION['user_id'])) {
+// Authorization check
+if (!isset($_SESSION['user_id']) || $_SESSION['status'] !== 'approved') {
     header("Location: login.php");
     exit();
 }
@@ -16,8 +17,8 @@ if (!isset($_SESSION['user_id'])) {
         .iframe-container {
             position: relative;
             overflow: hidden;
-            padding-top: 56.25%; /* 16:9 Aspect Ratio */
-            height: calc(100vh - 150px); /* Account for header/footer */
+            padding-top: 56.25%;
+            height: calc(100vh - 150px);
         }
         
         .iframe-container iframe {
@@ -52,6 +53,10 @@ if (!isset($_SESSION['user_id'])) {
             .card-body {
                 padding: 15px;
             }
+            
+            .nav-link {
+                padding: 0.5rem 0.7rem;
+            }
         }
     </style>
 </head>
@@ -62,9 +67,20 @@ if (!isset($_SESSION['user_id'])) {
             <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
                 <span class="navbar-toggler-icon"></span>
             </button>
-            <div class="collapse navbar-collapse justify-content-end" id="navbarNav">
-                <span class="navbar-text me-3 text-white">Welcome, <?php echo $_SESSION['username']; ?></span>
-                <a href="logout.php" class="btn btn-outline-light">Logout</a>
+            <div class="collapse navbar-collapse" id="navbarNav">
+                <div class="navbar-nav ms-auto">
+                    <?php if ($_SESSION['is_admin']): ?>
+                        <a class="nav-link me-3" href="admin.php">
+                            <i class="bi bi-shield-lock"></i> Admin Panel
+                        </a>
+                    <?php endif; ?>
+                    <span class="navbar-text text-white me-3">
+                        <i class="bi bi-person-circle"></i> <?= htmlspecialchars($_SESSION['username']) ?>
+                    </span>
+                    <a href="logout.php" class="btn btn-outline-light">
+                        <i class="bi bi-box-arrow-right"></i> Logout
+                    </a>
+                </div>
             </div>
         </div>
     </nav>
@@ -73,13 +89,16 @@ if (!isset($_SESSION['user_id'])) {
         <div class="row justify-content-center">
             <div class="col-12 col-lg-8">
                 <div class="card shadow-sm">
-                    <div class="card-header navbar-dark bg-dark text-white">
-                        <h3 class="text-center mb-0">Digital Irrigation System</h3>
+                    <div class="card-header bg-dark text-white">
+                        <h3 class="text-center mb-0">Digital Irrigation System Control Panel</h3>
                     </div>
                     <div class="card-body p-0">
                         <div class="iframe-container">
-                            <iframe src="http://192.168.137.132:8080"></iframe>
+                            <iframe src="http://192.168.137.206"></iframe>
                         </div>
+                    </div>
+                    <div class="card-footer bg-light text-center">
+                        <small class="text-muted">System Status: Connected</small>
                     </div>
                 </div>
             </div>

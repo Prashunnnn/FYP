@@ -12,15 +12,25 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
         exit();
     }
 
+    // Check if first user
+    $result = $conn->query("SELECT COUNT(*) AS count FROM users");
+    $row = $result->fetch_assoc();
+    $is_first = $row['count'] == 0;
+
+    $is_admin = $is_first ? 1 : 0;
+    $status = $is_first ? 'approved' : 'pending';
     $hashed_password = password_hash($password, PASSWORD_DEFAULT);
 
-    $stmt = $conn->prepare("INSERT INTO users (username, password, email) VALUES (?, ?, ?)");
-    $stmt->bind_param("sss", $username, $hashed_password, $email);
+    $stmt = $conn->prepare("INSERT INTO users (username, password, email, is_admin, status) VALUES (?, ?, ?, ?, ?)");
+    $stmt->bind_param("sssss", $username, $hashed_password, $email, $is_admin, $status);
 
     if ($stmt->execute()) {
-        header("Location: login.php?registration=success");
+        if ($is_first) {
+            header("Location: login.php?registration=success");
+        } else {
+            header("Location: login.php?pending=approval");
+        }
     } else {
-        // Handle duplicate entry error (MySQL error code 1062)
         if ($stmt->errno == 1062) {
             header("Location: register.php?error=duplicate");
         } else {

@@ -16,7 +16,7 @@
                 box-shadow: none;
             }
             .form-control {
-                font-size: 16px; /* Better for mobile zoom */
+                font-size: 16px;
                 height: 50px;
             }
             .btn {
@@ -39,9 +39,19 @@
         <div class="card shadow-sm">
             <div class="card-body p-4">
                 <h2 class="text-center mb-4">🔒 Login</h2>
-                <?php if(isset($_GET['error'])): ?>
-                    <div class="alert alert-danger py-2">⚠️ Invalid credentials!</div>
+                
+                <?php if(isset($_GET['pending'])): ?>
+                    <div class="alert alert-info py-2">📩 Your account is pending admin approval</div>
                 <?php endif; ?>
+                
+                <?php if(isset($_GET['error'])): ?>
+                    <?php if($_GET['error'] == 'pending'): ?>
+                        <div class="alert alert-warning py-2">⏳ Account not approved yet!</div>
+                    <?php else: ?>
+                        <div class="alert alert-danger py-2">⚠️ Invalid credentials!</div>
+                    <?php endif; ?>
+                <?php endif; ?>
+
                 <form action="login_process.php" method="POST">
                     <div class="mb-3">
                         <label class="form-label fw-medium">Username</label>
